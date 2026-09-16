@@ -1,0 +1,536 @@
+================================================================================
+FICHE DE RESOLUTION
+OpenMRS Reference Application en GitHub Codespace :
+  504 Gateway Timeout, puis ecran gris sur /openmrs/spa/home
+================================================================================
+Date               : 2026-09-16
+Environnement      : GitHub Codespaces / Linux 6.8.0-1064-azure (2 vCPU, 7,8 Gio)
+Depot              : openmrs-distro-referenceapplication (branche main, 118830d8)
+Docker             : 29.7.2-2 - Firewall Backend: iptables (nft)
+Statut final       : RESOLU - application fonctionnelle, donnees de demo completes
+                     Reserve : le correctif pare-feu n'est PAS persistant (sect. 7)
+
+TROIS PROBLEMES EMPILES, dont un seul a demande une intervention manuelle :
+  1. 504 Gateway Timeout ....... table iptables-legacy orpheline   -> sect. 1-9
+     Cause reelle, corrigee a la main par 3 regles ciblees.
+  2. Assistant initialsetup .... consequence en cascade du n.1     -> sect. 11 phase A
+     A necessite un "docker compose restart backend".
+  3. Ecran gris SPA ............ generation des donnees de demo    -> sect. 11 phase B
+     Aucune intervention : s'est termine tout seul. NE PAS couper.
+
+SOMMAIRE
+  PARTIE 1 - Le 504 Gateway Timeout
+    1. Symptomes observes
+    2. Pourquoi le diagnostic est trompeur
+    3. Cause racine
+    4. Commandes de diagnostic
+    5. Correctif applique
+    6. Verification apres correctif
+    7. Limite importante : le correctif n'est pas persistant
+    8. Annulation (retour a l'etat initial)
+    9. A retenir
+  PARTIE 2 - L'ecran gris qui a suivi
+   10. Symptome
+   11. Cause : deux phases distinctes (A: initialsetup, B: donnees de demo)
+   12. Commandes de diagnostic
+   13. Resolution et etat final
+   14. A retenir
+  ANNEXES
+   15. Chronologie de l'incident
+   16. Procedure de reprise rapide (en cas de recidive)
+
+
+--------------------------------------------------------------------------------
+1. SYMPTOMES OBSERVES
+--------------------------------------------------------------------------------
+- Ouverture du port 80 transfere par Codespaces => HTTP 504 Gateway Timeout.
+- Les 4 conteneurs sont demarres, mais "backend" reste (unhealthy) :
+
+    gateway-1    Up  0.0.0.0:80->80/tcp
+    frontend-1   Up  (healthy)      80/tcp
+    backend-1    Up  (unhealthy)    8080/tcp
+    db-1         Up  (healthy)      3306/tcp
+
+- Log nginx (gateway) :
+    [error] upstream timed out (110: Operation timed out) while connecting to
+    upstream, request: "GET /openmrs/spa/home", upstream: "http://172.18.0.4:80/home"
+    "GET /openmrs/spa/home HTTP/1.1" 504
+
+- Log backend bloque indefiniment sur :
+    Waiting for database to initialize...
+    wait-for-it.sh: waiting 3600 seconds for db:3306
+  ... alors que le conteneur "db" se declare (healthy).
+
+
+--------------------------------------------------------------------------------
+2. POURQUOI LE DIAGNOSTIC EST TROMPEUR
+--------------------------------------------------------------------------------
+Trois fausses pistes classiques sur ce probleme :
+
+a) "C'est localhost / le port forwarding Codespaces."
+   NON. Le port 80 publie fonctionne : nginx recoit bien les requetes, elles
+   apparaissent dans ses logs d'acces. Le trafic local hote -> conteneur passe
+   par la chaine OUTPUT, PAS par la chaine FORWARD, donc il n'est pas filtre.
+   Seuls les sauts DERRIERE nginx echouent.
+
+b) "C'est le DNS Docker."
+   NON. La resolution interne est correcte :
+       getent hosts frontend backend
+       172.18.0.4  frontend
+       172.18.0.3  backend
+   Les noms resolvent, c'est la connexion TCP qui echoue. D'ou l'apparence
+   d'un bug applicatif OpenMRS.
+
+c) "C'est OpenMRS / la configuration de la distro."
+   NON. Aucun fichier du depot n'est en cause. Le probleme est au niveau du
+   pare-feu du noyau de la machine hote.
+
+
+--------------------------------------------------------------------------------
+3. CAUSE RACINE
+--------------------------------------------------------------------------------
+Deux backends netfilter sont actifs SIMULTANEMENT sur la machine :
+
+  * iptables-nft  : utilise par Docker 29.7
+                    (/etc/alternatives/iptables -> /usr/sbin/iptables-nft)
+                    Docker y installe correctement ses chaines :
+                      -A DOCKER-FORWARD -i br-92f4e92bd07b -j ACCEPT
+                    => la table nft AUTORISE le trafic.
+
+  * iptables-legacy : table orpheline pre-remplie par l'image de base du
+                      Codespace, heritee d'une ancienne version de Docker :
+                        -P FORWARD DROP
+                        -A FORWARD -i docker0 ! -o docker0 -j ACCEPT
+                        -A FORWARD -i docker0 -o docker0 -j ACCEPT
+                      => aucune regle pour le bridge de la composition,
+                         et la politique par defaut est DROP.
+
+Un paquet doit etre accepte par LES DEUX backends pour passer. Le trafic
+conteneur -> conteneur sur le bridge de compose (br-92f4e92bd07b) est donc
+jete par la table legacy, bien que la table nft l'autorise.
+
+Consequence en chaine :
+   gateway -> frontend  : bloque  => nginx timeout => HTTP 504
+   backend -> db        : bloque  => wait-for-it.sh tourne dans le vide
+                                  => backend jamais (healthy)
+
+Indice a ne pas ignorer : toute commande iptables affiche l'avertissement
+   "Warning: iptables-legacy tables present, use iptables-legacy to see them"
+
+
+--------------------------------------------------------------------------------
+4. COMMANDES DE DIAGNOSTIC
+--------------------------------------------------------------------------------
+# 1. Etat et sante des conteneurs
+docker ps -a --format '{{.Names}}\t{{.Status}}\t{{.Ports}}'
+
+# 2. Logs revelateurs
+docker compose logs --tail 60 backend
+docker compose logs --tail 30 gateway
+
+# 3. Test decisif : DNS OK mais TCP KO ?
+docker compose exec -T gateway sh -c \
+  'getent hosts frontend backend; \
+   nc -z -w3 frontend 80   && echo FRONTEND_OK || echo FRONTEND_FAIL; \
+   nc -z -w3 backend 8080  && echo BACKEND_OK  || echo BACKEND_FAIL'
+
+# 4. Nom du bridge de la composition
+docker network ls
+docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' \
+  openmrs-distro-referenceapplication-frontend-1
+
+# 5. Comparer LES DEUX backends netfilter (l'etape qui revele tout)
+sudo iptables        -S FORWARD      # moderne : policy ACCEPT, chaines DOCKER-*
+sudo iptables-legacy -S FORWARD      # legacy  : policy DROP  <-- LE COUPABLE
+sudo iptables -S DOCKER-FORWARD
+
+# 6. Verifications annexes (ici toutes correctes, donc hors de cause)
+cat /proc/sys/net/ipv4/ip_forward                       # 1
+cat /proc/sys/net/bridge/bridge-nf-call-iptables        # 1
+docker info | grep -i 'firewall'                        # iptables
+
+
+--------------------------------------------------------------------------------
+5. CORRECTIF APPLIQUE
+--------------------------------------------------------------------------------
+Remede habituellement conseille sur le web (NON retenu ici) :
+    sudo iptables-legacy -P FORWARD ACCEPT
+  -> Efficace, mais desactive le filtrage de TOUT le trafic transite de la
+     machine. Trop large : rejete lors de cette intervention.
+
+Correctif retenu : trois regles ACCEPT ciblees sur le SEUL bridge du projet,
+la politique globale DROP restant intacte.
+
+    BR=br-92f4e92bd07b   # a adapter : voir section 4, commande 4
+
+    sudo iptables-legacy -I FORWARD 1 -i $BR -o $BR -j ACCEPT
+    sudo iptables-legacy -I FORWARD 2 -i $BR ! -o $BR -j ACCEPT
+    sudo iptables-legacy -I FORWARD 3 -o $BR \
+         -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+Resultat (la politique reste DROP, seul ce bridge est autorise) :
+    -P FORWARD DROP
+    -A FORWARD -i br-92f4e92bd07b -o br-92f4e92bd07b -j ACCEPT
+    -A FORWARD -i br-92f4e92bd07b ! -o br-92f4e92bd07b -j ACCEPT
+    -A FORWARD -o br-92f4e92bd07b -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    -A FORWARD -j DOCKER-USER
+    -A FORWARD -j DOCKER-ISOLATION-STAGE-1
+    ...
+
+Aucun redemarrage de conteneur n'a ete necessaire : le backend, qui bouclait
+sur wait-for-it.sh, a joint la base des l'application des regles.
+
+
+--------------------------------------------------------------------------------
+6. VERIFICATION APRES CORRECTIF
+--------------------------------------------------------------------------------
+docker compose exec -T gateway sh -c \
+  'nc -z -w3 frontend 80 && echo FRONTEND_OK; nc -z -w3 backend 8080 && echo BACKEND_OK'
+    => FRONTEND_OK / BACKEND_PORT_OK
+
+curl -s -o /dev/null -w 'HTTP %{http_code} in %{time_total}s\n' \
+  -m 25 http://localhost:80/openmrs/spa/home
+    => HTTP 200 in 0.001393s          (au lieu de 504 apres ~26 s de timeout)
+
+docker ps --format '{{.Names}}\t{{.Status}}'
+    => gateway / frontend / backend / db : tous (healthy)
+
+Logs backend : deblocage puis demarrage normal
+    Deployment of web application archive [openmrs.war] has finished in [10,544] ms
+    Starting ProtocolHandler ["http-nio-8080"]
+    Server startup in [10777] milliseconds
+    INFO Slf4JLogger - Table room_provider_map created      <- migrations Liquibase
+
+
+--------------------------------------------------------------------------------
+7. LIMITE IMPORTANTE : LE CORRECTIF N'EST PAS PERSISTANT
+--------------------------------------------------------------------------------
+Les regles visent un NOM D'INTERFACE (br-92f4e92bd07b), lui-meme derive de
+l'ID du reseau Docker. Elles sont donc perdues, et le 504 revient, apres :
+
+  - un "docker compose down" (le reseau est supprime puis recree avec un
+    nouvel ID, donc un nouveau nom de bridge) ;
+  - un redemarrage / une reconstruction du Codespace (table legacy remise a
+    zero par l'image de base).
+
+Un simple "docker compose restart" ou "stop/start" ne detruit pas le reseau :
+les regles survivent.
+
+Deux facons de rendre la solution durable :
+
+  Option A - Figer le nom du bridge dans la composition (fichier suivi par git)
+      networks:
+        default:
+          driver_opts:
+            com.docker.network.bridge.name: openmrs-br0
+      Les regles peuvent alors viser "openmrs-br0" de facon permanente.
+      Inconvenient : modifie un fichier du depot pour un contournement propre
+      a l'environnement Codespaces.
+
+  Option B - Script de post-demarrage hors depot (recommande)
+      Detecter le bridge puis reappliquer les regles, par exemple via
+      postStartCommand dans .devcontainer, ou a la main apres chaque
+      "compose up". Le nom du bridge se recupere ainsi :
+        NETID=$(docker network inspect -f '{{.Id}}' \
+                openmrs-distro-referenceapplication_default)
+        BR="br-${NETID:0:12}"
+
+
+--------------------------------------------------------------------------------
+8. ANNULATION (retour a l'etat initial)
+--------------------------------------------------------------------------------
+    BR=br-92f4e92bd07b
+    sudo iptables-legacy -D FORWARD -i $BR -o $BR -j ACCEPT
+    sudo iptables-legacy -D FORWARD -i $BR ! -o $BR -j ACCEPT
+    sudo iptables-legacy -D FORWARD -o $BR \
+         -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+Aucun fichier du depot n'a ete modifie par cette intervention : seules des
+regles de pare-feu en memoire ont ete ajoutees.
+
+
+--------------------------------------------------------------------------------
+9. A RETENIR
+--------------------------------------------------------------------------------
+Des conteneurs tous (healthy) qui ne parviennent PAS a se joindre entre eux,
+alors que le DNS interne resout correctement et que les ports publies
+repondent => suspecter iptables-legacy AVANT de toucher a la configuration
+applicative ou a la composition Docker.
+
+ATTENTION - le 504 corrige, l'application n'est PAS encore accessible pour
+autant. Le premier demarrage complet demande environ 20 a 30 minutes sur ce
+Codespace 2 vCPU (migrations Liquibase, puis generation des donnees de demo),
+et deux symptomes distincts se presentent ensuite. Ils sont traites dans la
+PARTIE 2 ci-dessous.
+
+CORRECTION D'UNE ERREUR D'APPRECIATION INITIALE : pendant cette intervention,
+la redirection HTTP 302 de /openmrs/ws/rest/v1/session vers
+/openmrs/initialsetup a d'abord ete prise pour un simple etat transitoire a
+attendre. C'est FAUX : il s'agissait d'un blocage reel de l'InitializationFilter
+qui ne se debloque JAMAIS seul et exige un redemarrage du backend
+(voir section 11, phase A). A l'inverse, l'ecran gris de la phase B, lui, se
+resout bien tout seul. Ne pas confondre les deux : le premier demande d'agir,
+le second demande d'attendre. Le discriminant est donne en section 12.
+
+Suivre l'avancement avec :
+    docker compose logs -f backend
+
+
+================================================================================
+PARTIE 2 - SUITE : ECRAN GRIS SUR /openmrs/spa/home (apres resolution du 504)
+================================================================================
+Statut : RESOLU sans intervention (attente de fin d'initialisation)
+
+
+--------------------------------------------------------------------------------
+10. SYMPTOME
+--------------------------------------------------------------------------------
+Le 504 a disparu, la page /openmrs/spa/home s'ouvre, mais affiche un ecran
+gris entierement vide. Aucun composant ne s'affiche.
+
+
+--------------------------------------------------------------------------------
+11. CAUSE : DEUX PHASES DISTINCTES, A NE PAS CONFONDRE
+--------------------------------------------------------------------------------
+PHASE A - Assistant "initialsetup" bloque (a necessite un redemarrage)
+  Le webapp a demarre AVANT que le fichier de proprietes runtime existe :
+      WARN OpenmrsUtil.getRuntimeProperties - Unable to find a runtime
+           properties file. Initial setup is needed.
+  OpenMRS a donc installe son InitializationFilter, puis l'auto-setup
+  (install_method=auto) a execute les migrations Liquibase et ecrit
+  /openmrs/data/openmrs-runtime.properties. Mais le filtre ne peut pas rendre
+  la main sans redemarrage, d'ou :
+      java.lang.IllegalStateException: Filters cannot be added to context
+      [/openmrs] as the context has been initialised
+  Consequence : /openmrs/ws/rest/v1/session renvoyait HTTP 302 vers
+  /openmrs/initialsetup au lieu du JSON attendu.
+  NOTE : cette course a ete provoquee par le blocage reseau de la partie 1,
+  qui a fait patienter le backend ~12 min sur wait-for-it.sh.
+
+  Correctif : docker compose restart backend
+  (Les regles iptables-legacy de la partie 1 SURVIVENT a un restart : le
+  reseau n'est pas recree. Verifie apres coup.)
+
+PHASE B - Generation des donnees de demo saturant le CPU (a juste demande du temps)
+  Apres le redemarrage, le port 8080 acceptait le TCP mais AUCUNE requete ne
+  recevait de reponse (HTTP 000 apres 180 s).
+  Element decisif du thread dump : ZERO thread "http-nio".
+  Le socket etait bien binde (les connexions s'empilaient dans la file
+  d'attente du noyau) mais aucun worker n'existait encore : Tomcat n'avait pas
+  fini de deployer openmrs.war. Confirmation dans les logs : "Done refreshing
+  Context" present, mais aucun "Server startup" apres le redemarrage.
+
+  Le thread responsable, identifie par le dump (611 s de CPU sur 1065 s) :
+      "pool-4-thread-1" ... runnable
+        org.openmrs.module.referencedemodata.orders.DemoOrderGenerator
+          .createDemoTestOrder(DemoOrderGenerator.java:57)
+        -> OrderServiceImpl.saveOrder
+        -> OrderServiceImpl.getActiveOrders
+        -> HibernateOrderDAO.getActiveOrders
+        -> SessionImpl.autoFlushIfRequired
+        -> AbstractFlushingEventListener.postFlush
+        -> StatefulPersistenceContext.forEachCollectionEntry
+  Le module referencedemodata genere les donnees de demo
+  (global_property referencedemodata.createDemoPatientsOnNextStartup = 50).
+  Chaque commande sauvegardee declenche un auto-flush Hibernate qui reparcourt
+  tout le contexte de persistance : cout quadratique. Sur 2 vCPU dont un
+  sature (+ pression GC : G1 Conc#0 a 170 s de CPU), l'operation est tres longue.
+
+POURQUOI L'ECRAN EST GRIS PLUTOT QU'UNE ERREUR :
+  Les fichiers statiques du SPA sont servis par le conteneur "frontend"
+  (nginx), independant du backend. Ils repondent donc HTTP 200 et la coquille
+  de l'application se charge normalement. Mais tous les appels API vers le
+  backend restent suspendus => aucun composant ne peut s'initialiser => gris.
+
+
+--------------------------------------------------------------------------------
+12. COMMANDES DE DIAGNOSTIC (PARTIE 2)
+--------------------------------------------------------------------------------
+# Distinguer "backend injoignable" de "backend qui ne repond pas"
+docker compose exec -T gateway sh -c 'nc -z -w3 backend 8080 && echo PORT_OK'
+docker compose exec -T gateway sh -c \
+  'curl -s -o /dev/null -w "%{http_code} in %{time_total}s\n" -m 45 http://backend:8080/openmrs/'
+   # PORT_OK + HTTP 000 = socket binde mais aucun worker => encore en deploiement
+
+# Le backend calcule-t-il ou est-il bloque ?
+docker stats --no-stream --format '{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}'
+   # backend a ~100% sur 2 vCPU => travail en cours, pas un deadlock
+
+# Jalons de demarrage (le "Server startup" est LE signal de fin de deploiement)
+docker compose logs backend | grep -E "Server startup|Done refreshing Context|Filters cannot"
+
+# Thread dump (attention : pgrep/which absents de l'image ; jcmd est present)
+docker compose exec -T backend sh -c \
+ 'for p in $(ls /proc | grep -E "^[0-9]+$"); do
+    exe=$(readlink /proc/$p/exe 2>/dev/null);
+    case "$exe" in *bin/java) jcmd $p Thread.print > /tmp/td.txt 2>&1; break;; esac;
+  done; grep -cE "^\"http-nio" /tmp/td.txt'          # 0 = pas encore de workers
+# Trier les threads par CPU consomme pour isoler le coupable
+docker compose exec -T backend sh -c 'grep -E "^\"" /tmp/td.txt | grep -i runnable'
+# Puis extraire sa pile
+docker compose exec -T backend sh -c 'awk "/^\"pool-4-thread-1\"/,/^\$/" /tmp/td.txt'
+
+# Mesurer l'avancement reel des donnees de demo (2 mesures espacees)
+docker compose exec -T db sh -c 'mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" -N -B openmrs -e "
+  SELECT CONCAT((SELECT COUNT(*) FROM patient),\"/\",
+                (SELECT COUNT(*) FROM orders),\"/\",
+                (SELECT COUNT(*) FROM obs));
+  SELECT CONCAT(property,\" = \",property_value) FROM global_property
+    WHERE property LIKE \"%demo%\";"'
+   # Vitesse observee ici : ~209 obs/min
+
+
+--------------------------------------------------------------------------------
+13. RESOLUTION ET ETAT FINAL
+--------------------------------------------------------------------------------
+La phase B s'est terminee d'elle-meme. Aucune action supplementaire n'a ete
+necessaire : il ne faut PAS couper la generation ni redemarrer une nouvelle
+fois, sous peine de perdre les donnees de demo pour rien.
+
+Marqueurs de fin de generation :
+  - backend CPU repasse de 98,5% a 0,40%
+  - referencedemodata.createDemoPatientsOnNextStartup remis a 0 par le module
+    lui-meme (c'est LE signal fiable que la generation a abouti)
+  - conteneur backend (healthy), "Server startup" present 2 fois dans les logs
+
+Jeu de donnees final : 50 patients / 322 orders / 5685 obs / 226 visits
+
+Latences mesurees apres resolution :
+  /openmrs/spa/home                       HTTP 200 en 0,005 s
+  /openmrs/spa/config-core_demo.json      HTTP 200 en 0,003 s
+  /openmrs/ws/rest/v1/session             HTTP 200 en 0,026 s
+     => {"authenticated":false,"locale":"en","allowedLocales":[...]}
+        "authenticated":false est la BONNE reponse : setup termine, simplement
+        pas encore connecte. Plus aucune redirection vers /initialsetup.
+  /openmrs/ws/rest/v1/systeminformation   HTTP 401 en 1,054 s
+     => normal, cet endpoint exige une authentification.
+
+Derniere etape cote navigateur : l'onglet reste gris car il a ete charge
+pendant l'indisponibilite. Forcer un vrai rechargement (Ctrl+Shift+R).
+Identifiants par defaut : admin / Admin123
+
+
+--------------------------------------------------------------------------------
+14. A RETENIR (PARTIE 2)
+--------------------------------------------------------------------------------
+- Ecran gris du SPA = coquille servie par le conteneur "frontend" + API
+  backend muette. Toujours tester /openmrs/ws/rest/v1/session directement :
+  un 302 vers /initialsetup ou un HTTP 000 designe immediatement le backend.
+- "Port ouvert" ne veut pas dire "application prete". Zero thread http-nio
+  dans un thread dump = webapp encore en deploiement, meme si nc reussit.
+- Avant de conclure a un blocage, verifier le CPU : ~100% = ca travaille.
+  Un thread dump designe le coupable exact en une minute, la ou l'attente
+  passive laisse dans le noir.
+- Le premier demarrage complet de cette distro sur un Codespace 2 vCPU
+  (migrations Liquibase + donnees de demo) demande environ 20 a 30 minutes.
+  Ne pas conclure trop vite a une panne.
+================================================================================
+
+
+================================================================================
+ANNEXES
+================================================================================
+
+--------------------------------------------------------------------------------
+15. CHRONOLOGIE DE L'INCIDENT
+--------------------------------------------------------------------------------
+14:55  Demarrage de la composition. gateway ecoute sur 0.0.0.0:80.
+       backend se bloque : "wait-for-it.sh: waiting 3600 seconds for db:3306"
+       alors que le conteneur db est (healthy).
+14:55  Premieres requetes : nginx les recoit bien (elles sont dans ses logs
+       d'acces), mais ne peut joindre aucun upstream.
+14:57  "upstream timed out while connecting to upstream ... 172.18.0.4:80"
+       => HTTP 504 renvoye au navigateur.
+~15:05 Diagnostic : le DNS inter-conteneurs resout correctement, mais le TCP
+       echoue (FRONTEND_FAIL / BACKEND_FAIL depuis gateway).
+       Decouverte des DEUX backends netfilter : nft autorise, legacy DROP.
+15:07  Application des 3 regles iptables-legacy ciblees sur le bridge.
+       Effet immediat, sans redemarrage : backend joint enfin la base,
+       Liquibase demarre, "Server startup in [10777] milliseconds".
+       /openmrs/spa/home repasse de 504 a HTTP 200.
+       -> PROBLEME 1 RESOLU.
+15:08  Les proprietes runtime sont ecrites (/openmrs/data/openmrs-runtime.properties),
+       mais trop tard : le webapp avait deja installe son InitializationFilter.
+       "IllegalStateException: Filters cannot be added to context [/openmrs]".
+       session renvoie 302 vers /initialsetup => ECRAN GRIS cote navigateur.
+15:17  docker compose restart backend.
+       (Verifie : les regles iptables survivent, le reseau n'est pas recree.)
+15:18  "Done refreshing Context", mais AUCUN "Server startup" : Tomcat n'a pas
+       fini de deployer openmrs.war.
+       -> PROBLEME 2 RESOLU, le 302 a disparu.
+~15:20 Le port 8080 accepte le TCP mais aucune requete ne recoit de reponse
+       (HTTP 000 apres 180 s). Backend a 98,5% de CPU.
+       Thread dump : ZERO thread http-nio, et "pool-4-thread-1" a 611 s de CPU
+       dans DemoOrderGenerator.createDemoTestOrder.
+       Mesure de l'avancement : ~209 obs/min. Generation en cours, pas un blocage.
+~15:35 Fin de la generation, d'elle-meme et sans intervention :
+       CPU 98,5% -> 0,40%, createDemoPatientsOnNextStartup remis a 0,
+       "Server startup" present, conteneur (healthy).
+       session renvoie {"authenticated":false,...} en 26 ms.
+       -> PROBLEME 3 RESOLU. Application accessible.
+
+Duree totale : ~40 min, dont ~12 min perdus a cause du blocage pare-feu
+(attente sur wait-for-it.sh) et ~15 min de generation des donnees de demo.
+
+
+--------------------------------------------------------------------------------
+16. PROCEDURE DE REPRISE RAPIDE (EN CAS DE RECIDIVE)
+--------------------------------------------------------------------------------
+A executer dans l'ordre. S'arreter des que l'application repond.
+
+ETAPE 1 - Le pare-feu bloque-t-il encore ? (a refaire apres tout compose down
+          ou toute reconstruction du Codespace)
+
+    sudo iptables-legacy -S FORWARD | head -1
+    # Si la reponse est "-P FORWARD DROP" et qu'aucune regle ne mentionne le
+    # bridge du projet, appliquer :
+
+    NETID=$(docker network inspect -f '{{.Id}}' \
+            openmrs-distro-referenceapplication_default)
+    BR="br-${NETID:0:12}"
+    sudo iptables-legacy -I FORWARD 1 -i $BR -o $BR -j ACCEPT
+    sudo iptables-legacy -I FORWARD 2 -i $BR ! -o $BR -j ACCEPT
+    sudo iptables-legacy -I FORWARD 3 -o $BR \
+         -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+
+    # Controle : doit afficher FRONTEND_OK
+    docker compose exec -T gateway sh -c 'nc -z -w3 frontend 80 && echo FRONTEND_OK'
+
+ETAPE 2 - Le backend est-il coince dans l'assistant initialsetup ?
+
+    curl -s -o /dev/null -w '%{http_code} -> %{redirect_url}\n' \
+         -m 20 http://localhost:80/openmrs/ws/rest/v1/session
+
+    # 302 -> /openmrs/initialsetup  => BLOCAGE REEL, n'attendre surtout pas :
+    docker compose restart backend
+    # 200 + {"authenticated":false,...}  => tout va bien, passer a l'etape 3.
+    # 000 (aucune reponse)              => passer a l'etape 3.
+
+ETAPE 3 - Distinguer "ca travaille" de "c'est plante"
+
+    docker stats --no-stream --format '{{.Name}}\t{{.CPUPerc}}' | grep backend
+
+    # ~100%  => generation des donnees de demo en cours : ATTENDRE, ne rien
+    #           couper, ne pas redemarrer (cela detruirait le travail deja fait).
+    #           Confirmer que ca avance (le nombre d'obs doit croitre) :
+    docker compose exec -T db sh -c 'mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" \
+      -N -B openmrs -e "SELECT COUNT(*) FROM obs;"'
+    # ~0% + session qui ne repond pas => la, chercher ailleurs (logs, memoire).
+
+ETAPE 4 - Confirmer que c'est termine (les 3 signaux fiables)
+
+    docker compose logs backend | grep -c "Server startup"     # >= 1
+    docker compose exec -T db sh -c 'mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" \
+      -N -B openmrs -e "SELECT property_value FROM global_property WHERE
+      property=\"referencedemodata.createDemoPatientsOnNextStartup\";"'   # 0
+    docker stats --no-stream --format '{{.CPUPerc}}' | head -1   # ~0%
+
+ETAPE 5 - Cote navigateur
+    Forcer un vrai rechargement : Ctrl+Shift+R (un onglet charge pendant
+    l'indisponibilite reste gris indefiniment).
+    Connexion : admin / Admin123
+
+RAPPEL - pour ne plus avoir a refaire l'etape 1 a chaque fois, voir les deux
+options durables de la section 7 (nom de bridge fige dans la composition, ou
+script postStartCommand dans .devcontainer).
+================================================================================
